@@ -1,110 +1,196 @@
 using UnityEngine;
-using System.Collections;
 
 public class AutonomousExplorer : MonoBehaviour
 {
-    [Header("Hareket Ayarlarý")]
-    public float moveSpeed = 3f;             // Forward hýzý
-    public float turnSpeed = 40f;            // Dönüþ hýzý
-    public float avoidanceThreshold = 8f;   // Çarpýþma riski algýlama mesafesi
-    public float checkRange = 25f;          // Saða/Sola tarama mesafesi
-    public LayerMask caveLayer;             // "Maðara" katmanýný seç
+    [Header("Denizaltý Fiziði (Momentum & Drift)")]
+    public float maxSpeed = 5f;
+    public float acceleration = 1.5f;
+    public float turnSpeed = 2f;
+    public float gravity = 0.2f;
+    public float waterDriftAmount = 0.5f;
 
-    [Header("Tarama Açýlarý")]
-    public float sweepAngle = 70f;          // Saða/Sola kaç derecelik açýyla bakýlacak
+    [Header("Çarpýþma ve Sekme (Bounce)")]
+    public float collisionRadius = 1.5f;    // Denizaltýnýn fiziksel büyüklüðü (Kalkaný)
+    public float bounceForce = 0.6f;        // Sekme þiddeti (1 = Zýpzýp top gibi seker, 0.6 = Su altýnda aðýr bir metal gibi seker)
 
-    private bool isTurning = false;
-    private Quaternion targetRotation;
+    [Header("Sensörler ve Kaçýþ")]
+    public float sensorLength = 20f;
+    public LayerMask caveLayer;
+
+    [Header("Yapay Zeka (Zeki Keþif)")]
+    public float targetUpdateInterval = 2f;
+    private float targetTimer = 0f;
+    private Vector3 globalTargetPosition;
+
+    private Vector3 currentVelocity;
+    private Vector3 targetDirection;
+
+    void Start()
+    {
+        currentVelocity = transform.forward * maxSpeed;
+        globalTargetPosition = transform.position + transform.forward * 20f;
+    }
 
     void Update()
     {
-        // Dönmüyorsak, dümdüz git ve önünü kolla
-        if (!isTurning)
+        // 1. Zeki Keþif
+        targetTimer -= Time.deltaTime;
+        if (targetTimer <= 0f)
         {
-            MoveForwardAndCheckObstacles();
+            FindGlobalTarget();
+            targetTimer = targetUpdateInterval;
+        }
+
+        // 2. Anlýk Engellerden Kaçýþ ve Yön Belirleme
+        DetermineBestDirection();
+
+        // 3. Organik Hata Payý (Su Akýntýsý)
+        float noiseX = Mathf.PerlinNoise(Time.time * 0.3f, 0f) * 2f - 1f;
+        float noiseY = Mathf.PerlinNoise(0f, Time.time * 0.3f) * 2f - 1f;
+        float noiseZ = Mathf.PerlinNoise(Time.time * 0.3f, Time.time * 0.3f) * 2f - 1f;
+        Vector3 drift = new Vector3(noiseX, noiseY, noiseZ) * waterDriftAmount;
+
+        // 4. Akýllý Fren 
+        float desiredSpeed = maxSpeed;
+        float angleToTarget = Vector3.Angle(transform.forward, targetDirection);
+        if (angleToTarget > 10f) desiredSpeed = Mathf.Lerp(maxSpeed, maxSpeed * 0.3f, angleToTarget / 90f);
+
+        if (Physics.Raycast(transform.position, transform.forward, out RaycastHit sensorHit, sensorLength, caveLayer))
+        {
+            desiredSpeed = Mathf.Min(desiredSpeed, maxSpeed * (sensorHit.distance / sensorLength));
+        }
+        desiredSpeed = Mathf.Max(desiredSpeed, maxSpeed * 0.25f);
+
+        // 5. MOMENTUM UYGULAMASI
+        Vector3 desiredVelocity = (targetDirection + drift).normalized * desiredSpeed;
+        currentVelocity = Vector3.Lerp(currentVelocity, desiredVelocity, acceleration * Time.deltaTime);
+        currentVelocity.y -= gravity * Time.deltaTime;
+
+        if (currentVelocity.sqrMagnitude > 0.1f)
+        {
+            Quaternion targetRot = Quaternion.LookRotation(currentVelocity.normalized);
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRot, turnSpeed * Time.deltaTime);
+        }
+
+        // --- 6. ÇARPIÞMA VE GERÝ SEKME (BOUNCE) SÝSTEMÝ ---
+        float moveDistance = currentVelocity.magnitude * Time.deltaTime;
+
+        // Denizaltýnýn etrafýnda sanal bir küre oluþturup hareket edeceði yöne fýrlatýyoruz
+        if (Physics.SphereCast(transform.position, collisionRadius, currentVelocity.normalized, out RaycastHit hit, moveDistance + 0.2f, caveLayer))
+        {
+            // Duvara çarptýk! Mevcut momentumu duvarýn açýsýna göre yansýt (Reflect) ve þiddetini düþür
+            currentVelocity = Vector3.Reflect(currentVelocity, hit.normal) * bounceForce;
+
+            // Duvarýn içine gömülmemesi için denizaltýyý hafifçe duvarýn dýþýna (geriye) it
+            transform.position = hit.point + hit.normal * (collisionRadius + 0.1f);
         }
         else
         {
-            // Belirlenen yöne doðru dön
-            transform.rotation = Quaternion.RotateTowards(transform.rotation, targetRotation, turnSpeed * Time.deltaTime);
+            // Yol temiz, normal ilerle
+            transform.position += currentVelocity * Time.deltaTime;
+        }
+    }
 
-            // Hedef açýya vardýk mý?
-            if (Quaternion.Angle(transform.rotation, targetRotation) < 1f)
+    void FindGlobalTarget()
+    {
+        Vector3 bestPoint = Vector3.zero;
+        float bestScore = -Mathf.Infinity;
+
+        for (int i = 0; i < 30; i++)
+        {
+            Vector3 randomPos = transform.position + Random.onUnitSphere * 40f;
+
+            if (MapManager.Instance != null)
             {
-                isTurning = false;
+                Vector3Int chunkCoord = MapManager.Instance.GetChunkCoordinate(randomPos);
+
+                bool isExplored = false;
+                if (MapManager.Instance.chunkMap.TryGetValue(chunkCoord, out ChunkData data))
+                {
+                    isExplored = data.isExplored;
+                }
+
+                if (!isExplored)
+                {
+                    Vector3 dirToPoint = randomPos - transform.position;
+
+                    if (!Physics.Raycast(transform.position, dirToPoint.normalized, dirToPoint.magnitude, caveLayer))
+                    {
+                        float score = Vector3.Dot(transform.forward, dirToPoint.normalized);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestPoint = randomPos;
+                        }
+                    }
+                }
             }
         }
+
+        globalTargetPosition = (bestPoint != Vector3.zero) ? bestPoint : transform.position + transform.forward * 20f;
     }
 
-    void MoveForwardAndCheckObstacles()
+    void DetermineBestDirection()
     {
-        // Önümüze bir ýþýn yolla
-        RaycastHit hit;
-        if (Physics.Raycast(transform.position, transform.forward, out hit, avoidanceThreshold, caveLayer))
+        Vector3[] directions = new Vector3[]
         {
-            // Çarpýþma riski! Dur ve etrafý kontrol et.
-            FindNewPath();
-        }
-        else
+            transform.forward,
+            transform.forward + transform.right * 0.6f,
+            transform.forward - transform.right * 0.6f,
+            transform.forward + transform.up * 0.6f,
+            transform.forward - transform.up * 0.6f,
+            transform.up,
+            -transform.up,
+            transform.forward + transform.right * 0.6f + transform.up * 0.6f,
+            transform.forward - transform.right * 0.6f + transform.up * 0.6f,
+            transform.forward + transform.right * 0.6f - transform.up * 0.6f,
+            transform.forward - transform.right * 0.6f - transform.up * 0.6f
+        };
+
+        Vector3 desiredDir = (globalTargetPosition - transform.position).normalized;
+        Vector3 bestDir = transform.forward;
+        float bestScore = -Mathf.Infinity;
+        bool allBlocked = true;
+
+        foreach (Vector3 dir in directions)
         {
-            // Yol açýk, ilerle
-            transform.Translate(Vector3.forward * moveSpeed * Time.deltaTime);
-        }
-    }
-
-    void FindNewPath()
-    {
-        float bestDistance = 0f;
-        float bestAngle = 0f;
-        bool foundPath = false;
-
-        // Saða ve sola geniþ açýlý ýþýnlar atýp en uzak noktayý buluyoruz
-        for (float currentAngle = -sweepAngle; currentAngle <= sweepAngle; currentAngle += 10f)
-        {
-            Quaternion rotationOffset = Quaternion.Euler(0, currentAngle, 0);
-            Vector3 checkDirection = rotationOffset * transform.forward;
-
-            RaycastHit checkHit;
-            if (Physics.Raycast(transform.position, checkDirection, out checkHit, checkRange, caveLayer))
+            if (Physics.Raycast(transform.position, dir.normalized, out RaycastHit hit, sensorLength, caveLayer))
             {
-                if (checkHit.distance > bestDistance)
+                if (hit.distance > sensorLength * 0.4f)
                 {
-                    bestDistance = checkHit.distance;
-                    bestAngle = currentAngle;
-                    foundPath = true;
+                    float score = Vector3.Dot(dir.normalized, desiredDir) * (hit.distance / sensorLength);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestDir = dir.normalized;
+                        allBlocked = false;
+                    }
                 }
             }
             else
             {
-                // Iþýn bir þeye çarpmadýysa, bu yol en temiz yoldur!
-                bestAngle = currentAngle;
-                foundPath = true;
-                break;
+                float score = Vector3.Dot(dir.normalized, desiredDir) + 2f;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestDir = dir.normalized;
+                    allBlocked = false;
+                }
             }
         }
 
-        if (foundPath)
-        {
-            // En iyi açýyý bulduk, o yöne dönmeyi baþlat
-            targetRotation = transform.rotation * Quaternion.Euler(0, bestAngle, 0);
-            isTurning = true;
-        }
-        else
-        {
-            // Hiçbir yer açýk deðilse (ki maðarada zor), 180 derece dön.
-            targetRotation = transform.rotation * Quaternion.Euler(0, 180f, 0);
-            isTurning = true;
-        }
+        targetDirection = allBlocked ? (-transform.forward + transform.up * 0.5f).normalized : bestDir;
     }
 
-    // Editörde hata ayýklamak için ýþýnlarý çiz
     void OnDrawGizmosSelected()
     {
-        Gizmos.color = Color.red;
-        Gizmos.DrawRay(transform.position, transform.forward * avoidanceThreshold);
+        Gizmos.color = Color.yellow;
 
-        Gizmos.color = Color.green;
-        Gizmos.DrawRay(transform.position, (Quaternion.Euler(0, sweepAngle, 0) * transform.forward) * checkRange);
-        Gizmos.DrawRay(transform.position, (Quaternion.Euler(0, -sweepAngle, 0) * transform.forward) * checkRange);
+        // Çarpýþma küresini (kalkaný) göster
+        Gizmos.color = new Color(1, 0, 0, 0.3f);
+        Gizmos.DrawWireSphere(transform.position, collisionRadius);
+
+        Gizmos.color = Color.blue;
+        if (Application.isPlaying) Gizmos.DrawWireSphere(globalTargetPosition, 2f);
     }
 }

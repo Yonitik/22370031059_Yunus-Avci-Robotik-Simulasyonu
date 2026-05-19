@@ -1,55 +1,110 @@
 using UnityEngine;
 using System.Collections.Generic;
 
+public class ChunkData
+{
+    public int surfaceHits;
+    public bool isExplored;
+    public GameObject visualCube; // YENÝ: Oyundaki gerçek küp objesini hafýzada tutuyoruz
+}
+
 public class MapManager : MonoBehaviour
 {
-    public static MapManager Instance; // Her yerden ulaþabilmek için Singleton
+    public static MapManager Instance;
 
-    [Header("Izgara (Grid) Ayarlarý")]
-    public float voxelSize = 1f; // Her bir sanal küpün boyutu (1 metre)
+    [Header("Chunk (Bölge) Ayarlarý")]
+    public float chunkSize = 10f;
+    public int hitsToExploreChunk = 50;
 
     [Header("Hedef Hacim (Yüzde Hesabý Ýçin)")]
-    // Maðaranýn tahmini geniþliði, yüksekliði ve derinliði
-    // Yüzde 100 olmasý için taranmasý gereken toplam hacim
     public Vector3 expectedCaveSize = new Vector3(100f, 50f, 100f);
-    private float totalExpectedVoxels;
+    private float totalExpectedChunks;
 
-    // Hafýza: 1 = Su (Ýçinden geçilebilir), 2 = Kaya (Engel)
-    // Dictionary'de olmayan yerler "Bilinmiyor (0)" sayýlýr.
-    public Dictionary<Vector3Int, byte> voxelGrid = new Dictionary<Vector3Int, byte>();
+    [Header("Oyun Ýçi Görsellik (Sol Kamera)")]
+    public bool showInGame = true;              // Oyunda küpleri göster
+    public Material unexploredMaterial;         // Kýrmýzý Saydam Materyal
+    public Material exploredMaterial;           // Yeþil Saydam Materyal
+
+    public Dictionary<Vector3Int, ChunkData> chunkMap = new Dictionary<Vector3Int, ChunkData>();
+
+    private int totalExploredChunks = 0;
 
     void Awake()
     {
         Instance = this;
-        // Toplam kaç tane sanal küp taramamýz gerektiðini hesaplýyoruz
-        totalExpectedVoxels = (expectedCaveSize.x / voxelSize) * (expectedCaveSize.y / voxelSize) * (expectedCaveSize.z / voxelSize);
+        totalExpectedChunks = (expectedCaveSize.x / chunkSize) * (expectedCaveSize.y / chunkSize) * (expectedCaveSize.z / chunkSize);
+        if (totalExpectedChunks <= 0) totalExpectedChunks = 1f;
     }
 
-    // Gerçek dünyadaki koordinatý, sanal ýzgara koordinatýna çevirir
-    public Vector3Int WorldToGrid(Vector3 pos)
+    public Vector3Int GetChunkCoordinate(Vector3 worldPos)
     {
         return new Vector3Int(
-            Mathf.FloorToInt(pos.x / voxelSize),
-            Mathf.FloorToInt(pos.y / voxelSize),
-            Mathf.FloorToInt(pos.z / voxelSize)
+            Mathf.FloorToInt(worldPos.x / chunkSize),
+            Mathf.FloorToInt(worldPos.y / chunkSize),
+            Mathf.FloorToInt(worldPos.z / chunkSize)
         );
     }
 
-    // Lazerin deðdiði yerleri hafýzaya yazma fonksiyonu
-    public void MarkVoxel(Vector3 pos, byte state)
+    public void RegisterSurfaceHit(Vector3 hitPoint)
     {
-        Vector3Int gridPos = WorldToGrid(pos);
+        Vector3Int chunkCoord = GetChunkCoordinate(hitPoint);
 
-        // Eðer orasý önceden "Kaya (2)" olarak iþaretlendiyse, yanlýþlýkla "Su (1)" ile ezmeyelim.
-        if (!voxelGrid.ContainsKey(gridPos) || voxelGrid[gridPos] != 2)
+        // ODA (CHUNK) ÝLK DEFA KEÞFEDÝLÝYORSA:
+        if (!chunkMap.ContainsKey(chunkCoord))
         {
-            voxelGrid[gridPos] = state;
+            GameObject newCube = null;
+
+            if (showInGame)
+            {
+                // Unity'nin varsayýlan küpünü kodla oluþturuyoruz
+                newCube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+
+                // Küpün dünyadaki tam merkezini ve boyutunu (10x10x10) ayarlýyoruz
+                newCube.transform.position = new Vector3(chunkCoord.x, chunkCoord.y, chunkCoord.z) * chunkSize + (Vector3.one * (chunkSize / 2f));
+                newCube.transform.localScale = Vector3.one * chunkSize;
+
+                // SADECE SOL KAMERADA GÖRÜNSÜN DÝYE: Katmanýný NoktaBulutu yapýyoruz!
+                newCube.layer = LayerMask.NameToLayer("NoktaBulutu");
+
+                // Lazerlerimizi engellemesin diye katý fizik özelliðini (Collider) siliyoruz
+                Destroy(newCube.GetComponent<Collider>());
+
+                // Ýlk rengini Kýrmýzý (Keþfedilmemiþ) yapýyoruz
+                if (unexploredMaterial != null)
+                    newCube.GetComponent<Renderer>().material = unexploredMaterial;
+            }
+
+            // Hafýzaya ekle
+            chunkMap[chunkCoord] = new ChunkData
+            {
+                surfaceHits = 0,
+                isExplored = false,
+                visualCube = newCube
+            };
+        }
+
+        ChunkData chunk = chunkMap[chunkCoord];
+
+        if (chunk.isExplored) return;
+
+        chunk.surfaceHits++;
+
+        // ODA (CHUNK) TAMAMEN TARANDIYSA:
+        if (chunk.surfaceHits >= hitsToExploreChunk)
+        {
+            chunk.isExplored = true;
+            totalExploredChunks++;
+
+            // Küpün rengini Yeþil (Keþfedilmiþ) olarak deðiþtir
+            if (chunk.visualCube != null && exploredMaterial != null)
+            {
+                chunk.visualCube.GetComponent<Renderer>().material = exploredMaterial;
+            }
         }
     }
 
-    // Tamamlanma yüzdesini döndürür
     public float GetCompletionPercentage()
     {
-        return (voxelGrid.Count / totalExpectedVoxels) * 100f;
+        return (totalExploredChunks / totalExpectedChunks) * 100f;
     }
 }
